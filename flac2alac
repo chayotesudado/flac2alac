@@ -1,0 +1,169 @@
+#!/bin/bash
+
+# flac2alac: convert a folder of FLAC files to ALAC (.m4a), losslessly.
+#
+# Usage: flac2alac [source-folder]
+#
+# - Searches the source folder and all subfolders for .flac files
+# - Keeps tags and the first embedded cover image
+# - Checks every file: the decoded audio of the .m4a must hash identical to the .flac
+# - Skips files that already have an .m4a, so re-running only does what's missing
+# - Writes to a .partial file first, so an interrupted run never leaves a half file
+
+set -uo pipefail
+
+# Match the current Omarchy theme even if the theme changed since login
+source omarchy-restart-gum 2>/dev/null || true
+
+LAUNCHER=false
+if [[ ${1:-} == --launcher ]]; then
+  LAUNCHER=true
+  shift
+fi
+
+finish() {
+  $LAUNCHER && command -v omarchy-show-done &>/dev/null && omarchy-show-done
+  exit "${1:-0}"
+}
+
+die() {
+  gum style --foreground 1 "✗ $*"
+  finish 1
+}
+
+# Runs inside gum spin. Exit codes: 0 ok, 1 ffmpeg failed, 2 audio mismatch.
+convert_one() {
+  local in="$1" out="$2" log="$3"
+  local tmp="${out%.m4a}.partial.m4a"
+
+  mkdir -p "$(dirname "$out")" || return 1
+
+  if ! ffmpeg -nostdin -y -loglevel error -i "$in" \
+      -map 0:a -map 0:v:0? -c:a alac -c:v copy -disposition:v attached_pic \
+      "$tmp" 2>>"$log"; then
+    echo "^ while converting: $in" >>"$log"
+    rm -f "$tmp"
+    return 1
+  fi
+
+  local a b
+  a=$(ffmpeg -nostdin -loglevel error -i "$in" -map 0:a -f md5 - 2>>"$log")
+  b=$(ffmpeg -nostdin -loglevel error -i "$tmp" -map 0:a -f md5 - 2>>"$log")
+
+  if [[ -z $a || $a != "$b" ]]; then
+    echo "audio mismatch: $in ($a vs $b)" >>"$log"
+    rm -f "$tmp"
+    return 2
+  fi
+
+  mv -f "$tmp" "$out"
+}
+export -f convert_one
+
+# Folder browser on gum filter (gum 2.0.2's `gum file` hides its header and first entry).
+# Type to search, enter to open a folder, pick "Use this folder" when you're in the right one.
+pick_dir() {
+  local title="$1" dir="$2" sel
+  local use="✓ Use this folder" up="↑ Parent folder"
+
+  while true; do
+    sel=$( {
+      echo "$use"
+      [[ $dir != / ]] && echo "$up"
+      find "$dir" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%f/\n' 2>/dev/null | sort -f
+    } | gum filter --header "$title"$'\n'"${dir/#$HOME/\~}" --placeholder "Type to search…") || return 1
+
+    case $sel in
+      "$use") echo "$dir"; return 0 ;;
+      "$up") dir=$(dirname "$dir") ;;
+      *) dir="${dir%/}/${sel%/}" ;;
+    esac
+  done
+}
+
+gum style --border rounded --padding "0 2" --margin "1 0" --bold "FLAC → ALAC"
+
+# 1. Source folder
+if [[ -n ${1:-} ]]; then
+  src="$1"
+else
+  start="$HOME/Music"
+  [[ -d $start ]] || start="$HOME"
+  src=$(pick_dir "Pick the folder with your FLACs" "$start") || finish 130
+fi
+src=$(realpath -- "$src" 2>/dev/null) || die "Folder not found: $1"
+[[ -d $src ]] || die "Not a folder: $src"
+
+mapfile -d '' flacs < <(cd "$src" && find . -type f -iname '*.flac' -print0 | sort -z)
+(( ${#flacs[@]} > 0 )) || die "No FLAC files in $src"
+
+# 2. Output location
+choice=$(gum choose --header "Where should the ALAC files go?" \
+  "Next to the FLAC files" \
+  "In another folder (keeps subfolders)") || finish 130
+
+if [[ $choice == Next* ]]; then
+  dest="$src"
+else
+  parent=$(pick_dir "Pick the output folder (a \"$(basename "$src")\" folder is created inside)" "$(dirname "$src")") || finish 130
+  dest="$(realpath -- "$parent")/$(basename "$src")"
+fi
+
+# 3. Work out what to do and confirm
+todo_in=() todo_out=()
+skipped=0
+for f in "${flacs[@]}"; do
+  rel="${f#./}"
+  out="$dest/${rel%.*}.m4a"
+  if [[ -e $out ]]; then
+    ((skipped++))
+  else
+    todo_in+=("$src/$rel")
+    todo_out+=("$out")
+  fi
+done
+total=${#todo_in[@]}
+
+gum style --foreground 8 "From:  ${src/#$HOME/\~}" "To:    ${dest/#$HOME/\~}" ""
+gum style "FLAC files found:   ${#flacs[@]}" \
+          "Already converted:  $skipped (skipped)" \
+          "To convert:         $total"
+echo
+
+(( total > 0 )) || { gum style --foreground 2 "✓ Nothing to do, everything is already converted."; finish 0; }
+
+gum confirm "Convert $total file(s)?" || finish 130
+
+# 4. Convert
+log=$(mktemp --tmpdir flac2alac.XXXXXX.log)
+ok=0 failed=()
+
+for i in "${!todo_in[@]}"; do
+  in="${todo_in[$i]}" out="${todo_out[$i]}"
+  name="${in#"$src"/}"
+
+  gum spin --spinner dot --title "[$((i + 1))/$total] $name" -- \
+    bash -c 'convert_one "$@"' _ "$in" "$out" "$log"
+  rc=$?
+
+  case $rc in
+    0) ((ok++)); echo "  ✓ $name" ;;
+    130) rm -f "${out%.m4a}.partial.m4a"; echo; die "Stopped. $ok file(s) done, run again to continue." ;;
+    2) failed+=("$name"); gum style --foreground 1 "  ✗ $name (audio did not match, file removed)" ;;
+    *) failed+=("$name"); gum style --foreground 1 "  ✗ $name (ffmpeg error)" ;;
+  esac
+done
+
+# 5. Report
+echo
+if (( ${#failed[@]} == 0 )); then
+  rm -f "$log"
+  gum style --foreground 2 --bold "✓ $ok converted, all verified bit-identical to the FLACs."
+  notify-send "FLAC → ALAC" "$ok file(s) converted and verified" 2>/dev/null
+  finish 0
+else
+  gum style --foreground 2 "✓ $ok converted and verified"
+  gum style --foreground 1 --bold "✗ ${#failed[@]} failed. Details: $log"
+  notify-send -u critical "FLAC → ALAC" "${#failed[@]} file(s) failed, see $log" 2>/dev/null
+  finish 1
+fi

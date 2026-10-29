@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Name=FLAC to ALAC
+Comment=Convert a folder of FLAC files to Apple Lossless
+Exec=xdg-terminal-exec --app-id=TUI.tile -e flac2alac --launcher
+Terminal=false
+Type=Application
+Icon=audio-x-generic
+Categories=AudioVideo;Audio;
+StartupNotify=true
