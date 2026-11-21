@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+
+# Repalac: a small GNOME app that converts a folder of FLAC files to ALAC (.m4a), losslessly.
+#
+# Usage: repalac [source-folder]
+#
+# Same behaviour as the flac2alac TUI:
+# - Searches the source folder and all subfolders for .flac files
+# - Keeps tags and the first embedded cover image
+# - Checks every file: the decoded audio of the .m4a must hash identical to the .flac
+# - Skips files that already have an .m4a, so re-running only does what's missing
+# - Writes to a .partial file first, so an interrupted run never leaves a half file
+
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
+
+APP_ID = "io.github.chayotesudado.Repalac"
+APP_NAME = "Repalac"
+VERSION = "1.0"
+
+OK, FFMPEG_ERROR, MISMATCH = range(3)
+
+
+# ── Conversion (no UI code) ──────────────────────────────────────────────────
+
+
+def find_flacs(src):
+    """Relative paths of all .flac files under src, sorted."""
+    found = []
+    for root, _dirs, files in os.walk(src):
+        for name in files:
+            if name.lower().endswith(".flac"):
+                found.append(os.path.relpath(os.path.join(root, name), src))
+    return sorted(found, key=str.casefold)
+
+
+def plan(src, dest, flacs):
+    """Split into (todo, skipped): todo is a list of (relative name, input, output)."""
+    todo, skipped = [], 0
+    for rel in flacs:
+        out = os.path.join(dest, os.path.splitext(rel)[0] + ".m4a")
+        if os.path.exists(out):
+            skipped += 1
+        else:
+            todo.append((rel, os.path.join(src, rel), out))
+    return todo, skipped
+
+
+class Cancelled(Exception):
+    pass
+
+
+class Converter:
+    """Converts files one by one on a worker thread and reports back on the main loop."""
+
+    def __init__(self, todo, log, on_progress, on_result, on_finished):
+        self.todo = todo
+        self.log = log
+        self.on_progress = on_progress  # (index, name)
+        self.on_result = on_result  # (name, status)
+        self.on_finished = on_finished  # (cancelled)
+        self.cancelled = False
+        self._proc = None
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def cancel(self):
+        with self._lock:
+            self.cancelled = True
+            if self._proc:
+                self._proc.terminate()
+
+    def wait(self, timeout=None):
+        self._thread.join(timeout)
+
+    def _idle(self, func, *args):
+        GLib.idle_add(lambda: func(*args) and False)
+
+    def _run(self):
+        for i, (name, src, out) in enumerate(self.todo):
+            if self.cancelled:
+                break
+            self._idle(self.on_progress, i, name)
+            try:
+                status = self._convert_one(src, out)
+            except Cancelled:
+                break
+            self._idle(self.on_result, name, status)
+        self._idle(self.on_finished, self.cancelled)
+
+    def _ffmpeg(self, *args):
+        with self._lock:
+            if self.cancelled:
+                raise Cancelled
+            self._proc = subprocess.Popen(
+                ["ffmpeg", "-nostdin", "-loglevel", "error", *args],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=self.log,
+                text=True,
+            )
+        out, _ = self._proc.communicate()
+        with self._lock:
+            rc, self._proc = self._proc.returncode, None
+            if self.cancelled:
+                raise Cancelled
+        return rc, out.strip()
+
+    def _audio_md5(self, path):
+        # Hash the decoded samples as 32-bit PCM so 24-bit audio is compared in full
+        # (the md5 muxer's default, 16-bit PCM, would drop the lowest 8 bits).
+        rc, out = self._ffmpeg("-i", path, "-map", "0:a", "-c:a", "pcm_s32le", "-f", "md5", "-")
+        return out if rc == 0 else ""
+
+    def _convert_one(self, src, out):
+        tmp = out[: -len(".m4a")] + ".partial.m4a"
+        try:
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+
+            rc, _ = self._ffmpeg(
+                "-y", "-i", src,
+                "-map", "0:a", "-map", "0:v:0?",
+                "-c:a", "alac", "-c:v", "copy", "-disposition:v", "attached_pic",
+                tmp,
+            )  # fmt: skip
+            if rc != 0:
+                self._write_log(f"^ while converting: {src}\n")
+                return FFMPEG_ERROR
+
+            a, b = self._audio_md5(src), self._audio_md5(tmp)
+            if not a or a != b:
+                self._write_log(f"audio mismatch: {src} ({a} vs {b})\n")
+                return MISMATCH
+
+            os.replace(tmp, out)
+            return OK
+        except OSError as e:
+            self._write_log(f"{e}\n")
+            return FFMPEG_ERROR
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+    def _write_log(self, text):
+        self.log.write(text)
+        self.log.flush()
+
+
+# ── UI ───────────────────────────────────────────────────────────────────────
+
+
+def tilde(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home) :] if path == home or path.startswith(home + "/") else path
+
+
+def plural(n, one, many):
+    return f"{n} {one if n == 1 else many}"
+
+
+def text_row(title, subtitle=""):
+    """An action row showing file names or paths, which must not be parsed as markup."""
+    row = Adw.ActionRow(use_markup=False)
+    row.set_title(title)
+    row.set_subtitle(subtitle)
+    return row
+
+
+def toast(title):
+    t = Adw.Toast(use_markup=False)
+    t.set_title(title)
+    return t
+
+
+def pill(label, style=None):
+    button = Gtk.Button(label=label, use_underline=True, halign=Gtk.Align.CENTER)
+    button.add_css_class("pill")
+    if style:
+        button.add_css_class(style)
+    return button
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(
+            application=app,
+            title=APP_NAME,
+            default_width=480,
+            default_height=640,
+            width_request=360,
+            height_request=294,
+        )
+        self.src = None
+        self.flacs = []
+        self.other_parent = None  # chosen "another folder", remembered while switching
+        self.use_other = False  # False: next to the FLAC files
+        self.converter = None
+        self.close_after_stop = False
+
+        self.nav = Adw.NavigationView()
+        self.toasts = Adw.ToastOverlay(child=self.nav)
+        self.set_content(self.toasts)
+        self.welcome = self.welcome_page()
+        self.nav.add(self.welcome)
+
+        open_action = Gio.SimpleAction(name="open")
+        open_action.connect("activate", lambda *_: self.choose_source())
+        self.add_action(open_action)
+
+        drop = Gtk.DropTarget.new(Gio.File, Gdk.DragAction.COPY)
+        drop.connect("drop", self.on_drop)
+        self.add_controller(drop)
+
+        self.connect("close-request", self.on_close_request)
+
+    # Pages
+
+    def page(self, title, tag, content, menu=False):
+        header = Adw.HeaderBar()
+        if menu:
+            menu_model = Gio.Menu()
+            menu_model.append(f"_About {APP_NAME}", "app.about")
+            header.pack_end(
+                Gtk.MenuButton(
+                    icon_name="open-menu-symbolic",
+                    menu_model=menu_model,
+                    primary=True,
+                    tooltip_text="Main Menu",
+                )
+            )
+        view = Adw.ToolbarView(content=content)
+        view.add_top_bar(header)
+        return Adw.NavigationPage(title=title, tag=tag, child=view)
+
+    def welcome_page(self):
+        if shutil.which("ffmpeg"):
+            status = Adw.StatusPage(
+                icon_name="folder-music-symbolic",
+                title="Convert FLAC to ALAC",
+                description="Choose or drop a folder of FLAC files. Every converted file "
+                "is checked to be bit-identical to the original.",
+            )
+            button = pill("_Choose Folder…", "suggested-action")
+            button.set_action_name("win.open")
+            status.set_child(button)
+        else:
+            status = Adw.StatusPage(
+                icon_name="dialog-warning-symbolic",
+                title="FFmpeg Is Not Installed",
+                description="Install FFmpeg with your package manager, then open this app again.",
+            )
+        return self.page(APP_NAME, "welcome", status, menu=True)
+
+    def setup_page(self):
+        prefs = Adw.PreferencesPage()
+
+        # Source
+        group = Adw.PreferencesGroup()
+        row = text_row("From", tilde(self.src))
+        row.add_css_class("property")
+        row.add_prefix(Gtk.Image(icon_name="folder-symbolic"))
+        group.add(row)
+        prefs.add(group)
+
+        # Destination
+        group = Adw.PreferencesGroup(title="Save To")
+        self.next_to_check = Gtk.CheckButton(active=not self.use_other)
+        row = Adw.ActionRow(title="Next to the FLAC files", activatable_widget=self.next_to_check)
+        row.add_prefix(self.next_to_check)
+        group.add(row)
+
+        self.other_check = Gtk.CheckButton(group=self.next_to_check, active=self.use_other)
+        self.other_row = text_row("In another folder")
+        self.other_row.set_activatable(True)
+        self.other_row.add_prefix(self.other_check)
+        choose = Gtk.Button(
+            icon_name="document-open-symbolic",
+            tooltip_text="Choose Folder",
+            valign=Gtk.Align.CENTER,
+        )
+        choose.add_css_class("flat")
+        choose.connect("clicked", lambda *_: self.choose_output())
+        self.other_row.add_suffix(choose)
+        self.other_row.connect("activated", lambda *_: self.on_other_activated())
+        group.add(self.other_row)
+        prefs.add(group)
+
+        self.next_to_check.connect("toggled", self.on_destination_toggled)
+
+        # Summary
+        self.summary = Adw.PreferencesGroup(title="Files")
+        self.found_label, self.skipped_label, self.todo_label = (Gtk.Label() for _ in range(3))
+        for title, label in (
+            ("FLAC files found", self.found_label),
+            ("Already converted", self.skipped_label),
+            ("To convert", self.todo_label),
+        ):
+            label.add_css_class("numeric")
+            row = Adw.ActionRow(title=title)
+            row.add_suffix(label)
+            self.summary.add(row)
+        prefs.add(self.summary)
+
+        group = Adw.PreferencesGroup()
+        self.convert_button = pill("", "suggested-action")
+        self.convert_button.connect("clicked", lambda *_: self.start())
+        group.add(self.convert_button)
+        prefs.add(group)
+
+        self.refresh_plan()
+        return self.page(os.path.basename(self.src) or self.src, "setup", prefs, menu=True)
+
+    def progress_page(self, total):
+        self.progress_status = Adw.StatusPage(title="Converting…")
+        self.progress_status.set_paintable(Adw.SpinnerPaintable(widget=self.progress_status))
+
+        self.progress_bar = Gtk.ProgressBar()
+        self.progress_file = Gtk.Label(ellipsize=Pango.EllipsizeMode.MIDDLE, css_classes=["dim-label"])
+        stop = pill("_Stop")
+        stop.connect("clicked", lambda *_: self.confirm_stop())
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.append(self.progress_bar)
+        box.append(self.progress_file)
+        box.append(stop)
+        self.progress_status.set_child(Adw.Clamp(child=box, maximum_size=360))
+
+        page = self.page("Converting", "progress", self.progress_status)
+        page.set_can_pop(False)
+        return page
+
+    def done_page(self, cancelled):
+        ok, failed = self.ok, self.failed
+        if cancelled:
+            status = Adw.StatusPage(
+                icon_name="media-playback-stop-symbolic",
+                title="Conversion Stopped",
+                description=f"{plural(ok, 'file was', 'files were')} converted. "
+                "Convert the folder again to continue where you left off.",
+            )
+        elif not failed:
+            status = Adw.StatusPage(
+                icon_name="emblem-ok-symbolic",
+                title="Conversion Complete",
+                description=f"{plural(ok, 'file', 'files')} converted and verified "
+                "bit-identical to the FLAC files.",
+            )
+        else:
+            status = Adw.StatusPage(
+                icon_name="dialog-warning-symbolic",
+                title="Some Files Failed",
+                description=f"{plural(ok, 'file', 'files')} converted and verified. "
+                f"{plural(len(failed), 'file', 'files')} failed and "
+                f"{'was' if len(failed) == 1 else 'were'} not saved.",
+            )
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        if failed:
+            listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
+            for name, reason in failed:
+                listbox.append(text_row(name, reason))
+            box.append(listbox)
+            log_button = pill("Open _Log")
+            log_button.connect("clicked", lambda *_: self.launch(self.log_path))
+            box.append(log_button)
+
+        buttons = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER, homogeneous=True)
+        open_button = pill("_Open Folder", "suggested-action")
+        open_button.connect("clicked", lambda *_: self.launch(self.dest))
+        again = pill("Convert _Another Folder")
+        again.connect("clicked", lambda *_: self.nav.replace([self.welcome]))
+        buttons.append(open_button)
+        buttons.append(again)
+        box.append(buttons)
+        status.set_child(Adw.Clamp(child=box, maximum_size=480))
+
+        page = self.page("Done", "done", status, menu=True)
+        page.set_can_pop(False)
+        return page
+
+    # Choosing folders
+
+    def choose_folder(self, title, initial, callback):
+        dialog = Gtk.FileDialog(title=title, modal=True)
+        if initial and os.path.isdir(initial):
+            dialog.set_initial_folder(Gio.File.new_for_path(initial))
+
+        def on_done(dialog, result):
+            try:
+                folder = dialog.select_folder_finish(result)
+            except GLib.Error:
+                return callback(None)  # dismissed
+            callback(folder.get_path() if folder else None)
+
+        dialog.select_folder(self, None, on_done)
+
+    def choose_source(self):
+        if self.converter or not shutil.which("ffmpeg"):
+            return
+        music = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_MUSIC)
+        initial = self.src or music or os.path.expanduser("~")
+        self.choose_folder("Choose the Folder With Your FLAC Files", initial,
+                           lambda path: path and self.load(path))  # fmt: skip
+
+    def on_drop(self, _target, file, _x, _y):
+        path = file.get_path()
+        if not path or self.converter:
+            return False
+        if not os.path.isdir(path):
+            path = os.path.dirname(path)
+        self.load(path)
+        return True
+
+    def load(self, path):
+        path = os.path.realpath(path)
+        if not os.path.isdir(path):
+            self.toasts.add_toast(toast(f"Not a folder: {tilde(path)}"))
+            return
+        self.src = path
+        self.other_parent, self.use_other = None, False
+
+        spinner = Adw.Spinner(width_request=32, height_request=32, halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        loading = self.page("Searching", "loading", spinner)
+        self.nav.replace([self.welcome, loading])
+
+        def scan():
+            flacs = find_flacs(path)
+            GLib.idle_add(lambda: self.on_scanned(path, flacs) and False)
+
+        threading.Thread(target=scan, daemon=True).start()
+
+    def on_scanned(self, path, flacs):
+        if path != self.src or self.nav.get_visible_page().get_tag() != "loading":
+            return  # user went back or picked another folder meanwhile
+        if not flacs:
+            self.nav.pop()
+            self.toasts.add_toast(toast("No FLAC files in this folder"))
+            return
+        self.flacs = flacs
+        self.nav.replace([self.welcome, self.setup_page()])
+
+    def on_destination_toggled(self, check):
+        if check.get_active():
+            self.use_other = False
+        elif self.other_parent is None:
+            return self.choose_output()
+        else:
+            self.use_other = True
+        self.refresh_plan()
+
+    def on_other_activated(self):
+        if self.other_parent is None:
+            self.choose_output()
+        else:
+            self.other_check.set_active(True)
+
+    def choose_output(self):
+        def on_chosen(path):
+            if path:
+                self.other_parent, self.use_other = os.path.realpath(path), True
+            # Sync the checks with what's actually chosen (dismissing keeps the old choice)
+            self.other_check.set_active(self.use_other)
+            self.next_to_check.set_active(not self.use_other)
+            self.refresh_plan()
+
+        initial = self.other_parent or os.path.dirname(self.src)
+        self.choose_folder("Choose Where to Save", initial, on_chosen)
+
+    @property
+    def dest(self):
+        if not self.use_other:
+            return self.src
+        return os.path.join(self.other_parent, os.path.basename(self.src))
+
+    def refresh_plan(self):
+        name = os.path.basename(self.src)
+        if self.other_parent is None:
+            self.other_row.set_subtitle(f"Choose a folder; a “{name}” folder is created inside it")
+        else:
+            self.other_row.set_subtitle(tilde(os.path.join(self.other_parent, name)))
+
+        self.todo, skipped = plan(self.src, self.dest, self.flacs)
+        n = len(self.todo)
+        self.found_label.set_label(str(len(self.flacs)))
+        self.skipped_label.set_label(str(skipped))
+        self.todo_label.set_label(str(n))
+
+        self.convert_button.set_sensitive(n > 0)
+        self.convert_button.set_label(f"_Convert {plural(n, 'File', 'Files')}" if n else "Nothing to Convert")
+        self.summary.set_description(
+            "" if n else "Everything here is already converted. Choose another place to save to convert again."
+        )
+
+    # Converting
+
+    def start(self):
+        total = len(self.todo)
+        self.ok, self.failed = 0, []
+        fd, self.log_path = tempfile.mkstemp(prefix="repalac.", suffix=".log")
+        self.log = os.fdopen(fd, "w")
+
+        self.nav.push(self.progress_page(total))
+        self.converter = Converter(
+            self.todo, self.log, self.on_progress, self.on_result, self.on_finished
+        )
+        self.converter.start()
+
+    def on_progress(self, index, name):
+        total = len(self.todo)
+        self.progress_status.set_description(f"File {index + 1} of {total}")
+        self.progress_bar.set_fraction(index / total)
+        self.progress_file.set_label(name)
+
+    def on_result(self, name, status):
+        if status == OK:
+            self.ok += 1
+        elif status == MISMATCH:
+            self.failed.append((name, "Audio did not match, file removed"))
+        else:
+            self.failed.append((name, "FFmpeg could not convert this file"))
+
+    def on_finished(self, cancelled):
+        self.converter = None
+        self.log.close()
+        if not self.failed:
+            os.remove(self.log_path)
+
+        if self.close_after_stop:
+            self.close()
+            return
+
+        self.nav.replace([self.welcome, self.done_page(cancelled)])
+
+        if not self.is_active() and not cancelled:
+            if self.failed:
+                note = Gio.Notification.new("Some Files Failed")
+                note.set_body(f"{plural(len(self.failed), 'file', 'files')} could not be converted")
+                note.set_priority(Gio.NotificationPriority.HIGH)
+            else:
+                note = Gio.Notification.new("Conversion Complete")
+                note.set_body(f"{plural(self.ok, 'file', 'files')} converted and verified")
+            self.get_application().send_notification("done", note)
+
+    def confirm_stop(self, then_close=False):
+        dialog = Adw.AlertDialog(
+            heading="Stop Converting?",
+            body="Files that are already converted are kept. "
+            "Convert the folder again to continue where you left off.",
+        )
+        dialog.add_response("continue", "_Keep Converting")
+        dialog.add_response("stop", "_Stop")
+        dialog.set_response_appearance("stop", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("continue")
+        dialog.set_close_response("continue")
+
+        def on_response(_dialog, response):
+            if response == "stop" and self.converter:
+                self.close_after_stop = then_close
+                self.converter.cancel()
+
+        dialog.connect("response", on_response)
+        dialog.present(self)
+
+    def on_close_request(self, _window):
+        if self.converter:
+            self.confirm_stop(then_close=True)
+            return True
+        return False
+
+    def launch(self, path):
+        Gtk.FileLauncher(file=Gio.File.new_for_path(path)).launch(self, None, None)
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_OPEN)
+        GLib.set_application_name(APP_NAME)
+        Gtk.Window.set_default_icon_name(APP_ID)
+
+        for name, accels, callback in (
+            ("about", [], self.on_about),
+            ("quit", ["<Control>q"], lambda *_: self.quit_app()),
+        ):
+            action = Gio.SimpleAction(name=name)
+            action.connect("activate", callback)
+            self.add_action(action)
+            self.set_accels_for_action(f"app.{name}", accels)
+        self.set_accels_for_action("win.open", ["<Control>o"])
+        self.set_accels_for_action("window.close", ["<Control>w"])
+
+    def window(self):
+        return self.get_active_window() or Window(self)
+
+    def do_activate(self):
+        self.window().present()
+
+    def do_open(self, files, _n, _hint):
+        win = self.window()
+        win.present()
+        if files and files[0].get_path():
+            win.load(files[0].get_path())
+
+    def quit_app(self):
+        win = self.get_active_window()
+        if win:
+            win.close()  # asks first while converting
+
+    def on_about(self, *_):
+        Adw.AboutDialog(
+            application_name=APP_NAME,
+            application_icon=APP_ID,
+            version=VERSION,
+            comments="Convert FLAC to Apple Lossless, bit for bit",
+            developer_name="Daniel Bullon",
+        ).present(self.get_active_window())
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

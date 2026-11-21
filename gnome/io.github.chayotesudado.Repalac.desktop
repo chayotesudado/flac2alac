@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Name=Repalac
+GenericName=Audio Converter
+Comment=Convert FLAC to Apple Lossless, bit for bit
+Exec=repalac %F
+Terminal=false
+Type=Application
+Icon=io.github.chayotesudado.Repalac
+Categories=AudioVideo;Audio;GTK;GNOME;
+Keywords=flac;alac;m4a;convert;lossless;apple;
+StartupNotify=true

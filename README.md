@@ -24,3 +24,18 @@ This symlinks `flac2alac` into `~/.local/bin` and the launcher entry into `~/.lo
 flac2alac              # pick the source folder interactively
 flac2alac ~/Music/X    # start with a source folder
 ```
+
+## Repalac (GNOME app)
+
+`gnome/` has Repalac, the same converter as a libadwaita app that follows the GNOME HIG: choose or drop a folder, pick where to save, convert, and see what failed. It keeps the same guarantees (verified lossless, skips done files, no half-written files), and runs in the background with a notification when it finishes.
+
+It installs as a Flatpak, so it works on image-based systems like openSUSE Aeon without installing anything on the host. It runs on the GNOME 51 runtime, which already includes Python, libadwaita and ffmpeg:
+
+```bash
+gnome/install.sh            # build and install for your user
+gnome/install.sh --bundle   # also write gnome/repalac.flatpak to install elsewhere
+```
+
+Then open "Repalac" from Activities, or `flatpak run io.github.chayotesudado.Repalac [folder]`.
+
+The app can read and write your home folder and removable drives (`/run/media`). Folders anywhere else work through the file chooser or drag and drop.
