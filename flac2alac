@@ -47,8 +47,9 @@ convert_one() {
   fi
 
   local a b
-  a=$(ffmpeg -nostdin -loglevel error -i "$in" -map 0:a -f md5 - 2>>"$log")
-  b=$(ffmpeg -nostdin -loglevel error -i "$tmp" -map 0:a -f md5 - 2>>"$log")
+  # Hash as 32-bit PCM so 24-bit audio is compared in full (the md5 default, 16-bit, drops the low 8 bits)
+  a=$(ffmpeg -nostdin -loglevel error -i "$in" -map 0:a -c:a pcm_s32le -f md5 - 2>>"$log")
+  b=$(ffmpeg -nostdin -loglevel error -i "$tmp" -map 0:a -c:a pcm_s32le -f md5 - 2>>"$log")
 
   if [[ -z $a || $a != "$b" ]]; then
     echo "audio mismatch: $in ($a vs $b)" >>"$log"
